@@ -3,84 +3,69 @@ package document
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-lambda-go/events"
+	"yourproject/internal/types"
+	"yourproject/internal/utils"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-
-	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-admin-lambda/internal/types"
-	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-admin-lambda/internal/util"
 )
 
-type GetS3ObjectHandler struct {
+type DeleteS3ObjectHandler struct {
 	S3Client *s3.Client
 }
 
-const maxKeys = 50
-
-func (h GetS3ObjectHandler) HandleRequest(request events.APIGatewayProxyRequest) (*events.APIGatewayProxyResponse, error, bool) {
-	headers := map[string]string{"Content-Type": "application/json"}
-	bucketName := request.Headers["bucket-name"]
-
-	source := request.QueryStringParameters["source"]
-	action := request.QueryStringParameters["action"]
-	encodedTitle := request.QueryStringParameters["baseEncodedDocumentTitle"]
-
-	if source == "" || action == "" || encodedTitle == "" {
-		resp, _ := util.RespondFailure("", "Missing query params", 400)
-		return &resp, nil, true
+func (h DeleteS3ObjectHandler) HandleRequest(request events.APIGatewayProxyRequest, bucketName string) (events.APIGatewayProxyResponse, error) {
+	headers := map[string]string{
+		"Content-Type": "application/json",
 	}
 
-	decodedKey, err := base64.URLEncoding.DecodeString(encodedTitle)
+	source, err := url.PathUnescape(request.PathParameters["source"])
 	if err != nil {
-		resp, _ := util.RespondFailure("", "Invalid document title encoding", 400)
-		return &resp, nil, true
+		return utils.GenerateErrorResponse(bucketName, "", "Invalid source")
 	}
 
-	objectKey := fmt.Sprintf("%s/%s/%s", source, action, string(decodedKey))
-
-	// Check for continuation token
-	continuationToken := request.Headers["x-continuation-token"]
-
-	// List objects with prefix
-	listInput := &s3.ListObjectsV2Input{
-		Bucket:            &bucketName,
-		Prefix:            &objectKey,
-		MaxKeys:           maxKeys,
-		ContinuationToken: nil,
-	}
-	if continuationToken != "" {
-		listInput.ContinuationToken = &continuationToken
-	}
-
-	listOutput, err := h.S3Client.ListObjectsV2(context.TODO(), listInput)
+	action, err := url.PathUnescape(request.PathParameters["action"])
 	if err != nil {
-		resp, _ := util.RespondFailure(objectKey, fmt.Sprintf("Error listing S3 objects: %v", err), 500)
-		return &resp, nil, true
+		return utils.GenerateErrorResponse(bucketName, "", "Invalid action")
 	}
 
-	// Build response
-	var keys []string
-	for _, obj := range listOutput.Contents {
-		keys = append(keys, *obj.Key)
+	baseEncodedDocumentTitle, err := url.PathUnescape(request.PathParameters["baseEncodedDocumentTitle"])
+	if err != nil {
+		return utils.GenerateErrorResponse(bucketName, "", "Invalid baseEncodedDocumentTitle")
 	}
 
-	respBody := types.Response{
-		Objects:            keys,
-		NextContinuationToken: *listOutput.NextContinuationToken,
-		TotalObjectCount:   int32(len(listOutput.Contents)),
+	var objectKey string
+
+	if source != "" && action != "" && baseEncodedDocumentTitle != "" {
+		decodedKey, err := base64.URLEncoding.DecodeString(baseEncodedDocumentTitle)
+		if err != nil {
+			return utils.GenerateErrorResponse(bucketName, "", "Invalid objectKey")
+		}
+		objectKey = strings.TrimSpace(fmt.Sprintf("%s/%s/%s", source, action, string(decodedKey)))
 	}
 
-	resJSON, _ := json.Marshal(respBody)
-	resp, _ := util.RespondSuccess(string(resJSON), headers)
-	return &resp, nil, true
-}
+	if objectKey == "" {
+		return utils.GenerateErrorResponse(bucketName, objectKey, "object key is passed as nil")
+	}
 
-func (h GetS3ObjectHandler) ShouldHandle(request events.APIGatewayProxyRequest) bool {
-	return request.HTTPMethod == "GET" && strings.Contains(request.Path, "/s3/document")
+	_, err = h.S3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: &bucketName,
+		Key:    &objectKey,
+	})
+	if err != nil {
+		return utils.GenerateErrorResponse(bucketName, objectKey, fmt.Sprintf("%s: Object does not exist in the bucket", err.Error()))
+	}
+
+	_, err = h.S3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+		Bucket: &bucketName,
+		Key:    &objectKey,
+	})
+	if err != nil {
+		return utils.GenerateErrorResponse(bucketName, objectKey, fmt.Sprintf("Error deleting %s: %v", objectKey, err.Error()))
+	}
+
+	return utils.GenerateSuccessResponse(bucketName, "", fmt.Sprintf("Deleted %s successfully", objectKey), headers)
 }
