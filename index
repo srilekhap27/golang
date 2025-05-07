@@ -1,0 +1,86 @@
+package document
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-admin-lambda/internal/types"
+	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-admin-lambda/internal/util"
+)
+
+type GetS3ObjectHandler struct {
+	S3Client *s3.Client
+}
+
+const maxKeys = 50
+
+func (h GetS3ObjectHandler) HandleRequest(request events.APIGatewayProxyRequest) (*events.APIGatewayProxyResponse, error, bool) {
+	headers := map[string]string{"Content-Type": "application/json"}
+	bucketName := request.Headers["bucket-name"]
+
+	source := request.QueryStringParameters["source"]
+	action := request.QueryStringParameters["action"]
+	encodedTitle := request.QueryStringParameters["baseEncodedDocumentTitle"]
+
+	if source == "" || action == "" || encodedTitle == "" {
+		resp, _ := util.RespondFailure("", "Missing query params", 400)
+		return &resp, nil, true
+	}
+
+	decodedKey, err := base64.URLEncoding.DecodeString(encodedTitle)
+	if err != nil {
+		resp, _ := util.RespondFailure("", "Invalid document title encoding", 400)
+		return &resp, nil, true
+	}
+
+	objectKey := fmt.Sprintf("%s/%s/%s", source, action, string(decodedKey))
+
+	// Check for continuation token
+	continuationToken := request.Headers["x-continuation-token"]
+
+	// List objects with prefix
+	listInput := &s3.ListObjectsV2Input{
+		Bucket:            &bucketName,
+		Prefix:            &objectKey,
+		MaxKeys:           maxKeys,
+		ContinuationToken: nil,
+	}
+	if continuationToken != "" {
+		listInput.ContinuationToken = &continuationToken
+	}
+
+	listOutput, err := h.S3Client.ListObjectsV2(context.TODO(), listInput)
+	if err != nil {
+		resp, _ := util.RespondFailure(objectKey, fmt.Sprintf("Error listing S3 objects: %v", err), 500)
+		return &resp, nil, true
+	}
+
+	// Build response
+	var keys []string
+	for _, obj := range listOutput.Contents {
+		keys = append(keys, *obj.Key)
+	}
+
+	respBody := types.Response{
+		Objects:            keys,
+		NextContinuationToken: *listOutput.NextContinuationToken,
+		TotalObjectCount:   int32(len(listOutput.Contents)),
+	}
+
+	resJSON, _ := json.Marshal(respBody)
+	resp, _ := util.RespondSuccess(string(resJSON), headers)
+	return &resp, nil, true
+}
+
+func (h GetS3ObjectHandler) ShouldHandle(request events.APIGatewayProxyRequest) bool {
+	return request.HTTPMethod == "GET" && strings.Contains(request.Path, "/s3/document")
+}
