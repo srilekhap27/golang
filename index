@@ -3,116 +3,110 @@ package document
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-cloud-commons/modules/repositories"
 	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-admin-lambda/internal/util"
-)
-
-const (
-	maxKeys = 50
+	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-cloud-commons/modules/repositories"
 )
 
 type GetS3ObjectHandler struct {
 	S3Client *repositories.S3Client
 }
 
-func (h *GetS3ObjectHandler) ShouldHandle(request events.APIGatewayProxyRequest) bool {
-	return request.Path == "/v1/document"
+const maxKeys = 50
+
+type Response struct {
+	Objects               []string `json:"objects"`
+	NextContinuationToken string   `json:"nextContinuationToken"`
+	TotalObjectCount      int32    `json:"totalObjectCount"`
 }
 
-func (h *GetS3ObjectHandler) HandleRequest(request events.APIGatewayProxyRequest) (*events.APIGatewayProxyResponse, error, bool) {
-	source, err := url.PathUnescape(request.PathParameters["source"])
-	if err != nil {
-		return util.GenerateErrorResponse("", "", "Invalid source"), nil, true
-	}
+type OutputResponse struct {
+	BucketName   string    `json:"bucketName"`
+	Key          string    `json:"key"`
+	ErrorMessage string    `json:"errorMessage"`
+	Timestamp    time.Time `json:"timestamp"`
+	Body         string    `json:"body"`
+}
 
-	action, err := url.PathUnescape(request.PathParameters["action"])
-	if err != nil {
-		return util.GenerateErrorResponse("", "", "Invalid action"), nil, true
-	}
-
-	baseEncodedDocumentTitle, err := url.PathUnescape(request.PathParameters["baseEncodedDocumentTitle"])
-	if err != nil {
-		return util.GenerateErrorResponse("", "", "Invalid baseEncodedDocumentTitle"), nil, true
-	}
-
-	var bucketPrefix, objectKey string
-	var body []byte
-
-	if source != "" && action != "" && baseEncodedDocumentTitle == "" {
-		bucketPrefix = fmt.Sprintf("%s/%s", source, action)
-	} else if source != "" && action == "" && baseEncodedDocumentTitle == "" {
-		bucketPrefix = fmt.Sprintf("%s", source)
-	} else if source != "" && action != "" && baseEncodedDocumentTitle != "" {
-		decodedKey, err := base64.URLEncoding.DecodeString(baseEncodedDocumentTitle)
-		if err != nil {
-			return util.GenerateErrorResponse("", "", "Invalid objectKey"), nil, true
-		}
-		objectKey = strings.TrimSpace(fmt.Sprintf("%s/%s/%s", source, action, string(decodedKey)))
-	}
-
+func (h *GetS3ObjectHandler) HandleRequest(request events.APIGatewayProxyRequest, bucketName string) (*events.APIGatewayProxyResponse, error, bool) {
 	headers := map[string]string{
 		"Content-Type": "application/json",
 	}
 
-	if objectKey == "" {
-		// fetch all objects
-		var allObjects []string
-		var totalObjects int32
-		continuationToken := request.Headers["x-continuation-token"]
-
-		if continuationToken == "" && len(continuationToken) == 0 {
-			totalObjectResult, err := h.S3Client.ListObjectKeys(context.TODO(), request.Headers["bucket-name"], bucketPrefix, "", 0)
-			if err != nil {
-				return util.GenerateErrorResponse("", "", err.Error()), nil, true
-			}
-			totalObjects = totalObjectResult.KeyCount
-		}
-
-		result, err := h.S3Client.ListObjectsV2(context.TODO(), request.Headers["bucket-name"], bucketPrefix, continuationToken, maxKeys)
-		if err != nil {
-			return util.GenerateErrorResponse("", "", err.Error()), nil, true
-		}
-
-		for _, object := range result.Contents {
-			allObjects = append(allObjects, *object.Key)
-		}
-
-		if result.IsTruncated != nil && *result.IsTruncated {
-			continuationToken = string(*result.NextContinuationToken)
-		}
-
-		headers["x-continuation-token"] = continuationToken
-
-		resp := struct {
-			Objects              []string `json:"objects"`
-			NextContinuationToken string   `json:"nextContinuationToken"`
-			TotalObjectCount     int32    `json:"totalObjectCount"`
-		}{
-			Objects:              allObjects,
-			NextContinuationToken: continuationToken,
-			TotalObjectCount:     totalObjects,
-		}
-
-		body, _ = json.Marshal(resp)
-	} else {
-		getObjectOutput, err := h.S3Client.GetObject(context.TODO(), request.Headers["bucket-name"], objectKey)
-		if err != nil {
-			return util.GenerateErrorResponse("", objectKey, err.Error()), nil, true
-		}
-		defer getObjectOutput.Body.Close()
-
-		body, err = io.ReadAll(getObjectOutput.Body)
-		if err != nil {
-			return util.GenerateErrorResponse("", objectKey, "Failed to read object body"), nil, true
-		}
+	source, err := url.PathUnescape(request.PathParameters["source"])
+	if err != nil {
+		resp, _ := util.GenerateErrorResponse(bucketName, "", "Invalid source")
+		return &resp, nil, true
+	}
+	action, err := url.PathUnescape(request.PathParameters["action"])
+	if err != nil {
+		resp, _ := util.GenerateErrorResponse(bucketName, "", "Invalid action")
+		return &resp, nil, true
 	}
 
-	return util.GenerateSuccessResponse(request.Headers["bucket-name"], objectKey, "", string(body), headers), nil, false
+	encodedTitle := request.PathParameters["baseEncodedDocumentTitle"]
+	if source == "" || action == "" || encodedTitle == "" {
+		resp, _ := util.GenerateErrorResponse("", "", "Missing path parameters")
+		return &resp, nil, true
+	}
+
+	decodedKey, err := base64.URLEncoding.DecodeString(encodedTitle)
+	if err != nil {
+		resp, _ := util.GenerateErrorResponse(bucketName, "", "Invalid document title encoding")
+		return &resp, nil, true
+	}
+
+	objectKey := fmt.Sprintf("%s/%s/%s", source, action, string(decodedKey))
+
+	// Check for continuation token
+	continuationToken := request.Headers["x-continuation-token"]
+
+	// List objects using pagination (wrapper method)
+	listResult, err := h.S3Client.ListObjectsV2(context.TODO(), bucketName, objectKey, continuationToken, maxKeys)
+	if err != nil {
+		resp, _ := util.GenerateErrorResponse(bucketName, objectKey, fmt.Sprintf("Error listing S3 objects: %v", err))
+		return &resp, nil, true
+	}
+
+	// If continuation token present or results are paginated, return object keys instead of body
+	if listResult.NextContinuationToken != nil || len(listResult.Contents) > 1 {
+		headers["x-continuation-token"] = *listResult.NextContinuationToken
+		objectKeys := make([]string, 0, len(listResult.Contents))
+		for _, obj := range listResult.Contents {
+			objectKeys = append(objectKeys, *obj.Key)
+		}
+
+		res := Response{
+			Objects:               objectKeys,
+			NextContinuationToken: *listResult.NextContinuationToken,
+			TotalObjectCount:      int32(len(listResult.Contents)),
+		}
+		resJSON, _ := json.Marshal(res)
+		successResp, _ := util.GenerateSuccessResponse(bucketName, objectKey, "", string(resJSON), headers)
+		return &successResp, nil, false
+	}
+
+	// If no pagination needed, get actual object content
+	getObjectOutput, err := h.S3Client.GetObject(context.TODO(), bucketName, objectKey)
+	if err != nil {
+		resp, _ := util.GenerateErrorResponse(bucketName, objectKey, fmt.Sprintf("Error retrieving object: %v", err))
+		return &resp, nil, true
+	}
+	defer getObjectOutput.Body.Close()
+
+	data, err := io.ReadAll(getObjectOutput.Body)
+	if err != nil {
+		resp, _ := util.GenerateErrorResponse(bucketName, objectKey, "Failed to read object body")
+		return &resp, nil, true
+	}
+
+	successResp, _ := util.GenerateSuccessResponse(bucketName, objectKey, "", string(data), headers)
+	return &successResp, nil, false
 }
