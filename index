@@ -6,66 +6,113 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
-	"yourproject/internal/types"
-	"yourproject/internal/utils"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-cloud-commons/modules/repositories"
+	"prodgitlab.usaa.com/grp-aws-my-documents/mydocs-admin-lambda/internal/util"
 )
 
-type DeleteS3ObjectHandler struct {
-	S3Client *s3.Client
+const (
+	maxKeys = 50
+)
+
+type GetS3ObjectHandler struct {
+	S3Client *repositories.S3Client
 }
 
-func (h DeleteS3ObjectHandler) HandleRequest(request events.APIGatewayProxyRequest, bucketName string) (events.APIGatewayProxyResponse, error) {
-	headers := map[string]string{
-		"Content-Type": "application/json",
-	}
+func (h *GetS3ObjectHandler) ShouldHandle(request events.APIGatewayProxyRequest) bool {
+	return request.Path == "/v1/document"
+}
 
+func (h *GetS3ObjectHandler) HandleRequest(request events.APIGatewayProxyRequest) (*events.APIGatewayProxyResponse, error, bool) {
 	source, err := url.PathUnescape(request.PathParameters["source"])
 	if err != nil {
-		return utils.GenerateErrorResponse(bucketName, "", "Invalid source")
+		return util.GenerateErrorResponse("", "", "Invalid source"), nil, true
 	}
 
 	action, err := url.PathUnescape(request.PathParameters["action"])
 	if err != nil {
-		return utils.GenerateErrorResponse(bucketName, "", "Invalid action")
+		return util.GenerateErrorResponse("", "", "Invalid action"), nil, true
 	}
 
 	baseEncodedDocumentTitle, err := url.PathUnescape(request.PathParameters["baseEncodedDocumentTitle"])
 	if err != nil {
-		return utils.GenerateErrorResponse(bucketName, "", "Invalid baseEncodedDocumentTitle")
+		return util.GenerateErrorResponse("", "", "Invalid baseEncodedDocumentTitle"), nil, true
 	}
 
-	var objectKey string
+	var bucketPrefix, objectKey string
+	var body []byte
 
-	if source != "" && action != "" && baseEncodedDocumentTitle != "" {
+	if source != "" && action != "" && baseEncodedDocumentTitle == "" {
+		bucketPrefix = fmt.Sprintf("%s/%s", source, action)
+	} else if source != "" && action == "" && baseEncodedDocumentTitle == "" {
+		bucketPrefix = fmt.Sprintf("%s", source)
+	} else if source != "" && action != "" && baseEncodedDocumentTitle != "" {
 		decodedKey, err := base64.URLEncoding.DecodeString(baseEncodedDocumentTitle)
 		if err != nil {
-			return utils.GenerateErrorResponse(bucketName, "", "Invalid objectKey")
+			return util.GenerateErrorResponse("", "", "Invalid objectKey"), nil, true
 		}
 		objectKey = strings.TrimSpace(fmt.Sprintf("%s/%s/%s", source, action, string(decodedKey)))
 	}
 
+	headers := map[string]string{
+		"Content-Type": "application/json",
+	}
+
 	if objectKey == "" {
-		return utils.GenerateErrorResponse(bucketName, objectKey, "object key is passed as nil")
+		// fetch all objects
+		var allObjects []string
+		var totalObjects int32
+		continuationToken := request.Headers["x-continuation-token"]
+
+		if continuationToken == "" && len(continuationToken) == 0 {
+			totalObjectResult, err := h.S3Client.ListObjectKeys(context.TODO(), request.Headers["bucket-name"], bucketPrefix, "", 0)
+			if err != nil {
+				return util.GenerateErrorResponse("", "", err.Error()), nil, true
+			}
+			totalObjects = totalObjectResult.KeyCount
+		}
+
+		result, err := h.S3Client.ListObjectsV2(context.TODO(), request.Headers["bucket-name"], bucketPrefix, continuationToken, maxKeys)
+		if err != nil {
+			return util.GenerateErrorResponse("", "", err.Error()), nil, true
+		}
+
+		for _, object := range result.Contents {
+			allObjects = append(allObjects, *object.Key)
+		}
+
+		if result.IsTruncated != nil && *result.IsTruncated {
+			continuationToken = string(*result.NextContinuationToken)
+		}
+
+		headers["x-continuation-token"] = continuationToken
+
+		resp := struct {
+			Objects              []string `json:"objects"`
+			NextContinuationToken string   `json:"nextContinuationToken"`
+			TotalObjectCount     int32    `json:"totalObjectCount"`
+		}{
+			Objects:              allObjects,
+			NextContinuationToken: continuationToken,
+			TotalObjectCount:     totalObjects,
+		}
+
+		body, _ = json.Marshal(resp)
+	} else {
+		getObjectOutput, err := h.S3Client.GetObject(context.TODO(), request.Headers["bucket-name"], objectKey)
+		if err != nil {
+			return util.GenerateErrorResponse("", objectKey, err.Error()), nil, true
+		}
+		defer getObjectOutput.Body.Close()
+
+		body, err = io.ReadAll(getObjectOutput.Body)
+		if err != nil {
+			return util.GenerateErrorResponse("", objectKey, "Failed to read object body"), nil, true
+		}
 	}
 
-	_, err = h.S3Client.GetObject(context.TODO(), &s3.GetObjectInput{
-		Bucket: &bucketName,
-		Key:    &objectKey,
-	})
-	if err != nil {
-		return utils.GenerateErrorResponse(bucketName, objectKey, fmt.Sprintf("%s: Object does not exist in the bucket", err.Error()))
-	}
-
-	_, err = h.S3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
-		Bucket: &bucketName,
-		Key:    &objectKey,
-	})
-	if err != nil {
-		return utils.GenerateErrorResponse(bucketName, objectKey, fmt.Sprintf("Error deleting %s: %v", objectKey, err.Error()))
-	}
-
-	return utils.GenerateSuccessResponse(bucketName, "", fmt.Sprintf("Deleted %s successfully", objectKey), headers)
+	return util.GenerateSuccessResponse(request.Headers["bucket-name"], objectKey, "", string(body), headers), nil, false
 }
